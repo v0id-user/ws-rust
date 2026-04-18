@@ -11,8 +11,8 @@ use std::net::SocketAddr;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
-/// Chained SHA-256 rounds per incoming message (0 = skip). Non-zero kills msg/s; raise only for CPU experiments.
-const STRESS_HASH_ROUNDS: usize = 0;
+/// Chained SHA-256 rounds per incoming message (0 = skip). Dummy project: edit here.
+const STRESS_HASH_ROUNDS: usize = 2000;
 
 fn listen_addr() -> SocketAddr {
     let port: u16 = std::env::var("PORT")
