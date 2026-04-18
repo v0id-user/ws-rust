@@ -1,0 +1,2 @@
+# Stress tooling; keep Rust as the visible primary language on GitHub.
+*.py linguist-detectable=false
