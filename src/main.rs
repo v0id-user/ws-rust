@@ -8,11 +8,11 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
-use tracing::{info, trace, warn};
+use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
-/// Chained SHA-256 rounds per incoming message (0 = skip). Dummy project: edit here.
-const STRESS_HASH_ROUNDS: usize = 2000;
+/// Chained SHA-256 rounds per incoming message (0 = skip). Non-zero kills msg/s; raise only for CPU experiments.
+const STRESS_HASH_ROUNDS: usize = 0;
 
 fn listen_addr() -> SocketAddr {
     let port: u16 = std::env::var("PORT")
@@ -50,17 +50,19 @@ async fn stress_cpu_on_payload(data: &[u8]) {
     })
     .await;
     if let Err(err) = res {
-        warn!(?err, "stress hash task join failed");
+        let _ = err; // dummy project: avoid warn!/tracing spam under Railway log limits
     }
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // Default: quiet libraries; this crate logs INFO only for startup/diagnostics.
-        // Per-message noise is TRACE (off unless RUST_LOG=trace or RUST_LOG=ws_rust=trace).
-        EnvFilter::new("warn,ws_rust=info")
-    });
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Hard cap: never emit above ERROR, even if RUST_LOG is set too chatty.
+    // Default: error only (Railway ~500 logs/s deployment limit).
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("error"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_max_level(Level::ERROR)
+        .init();
 }
 
 #[tokio::main]
@@ -74,14 +76,8 @@ async fn main() -> anyhow::Result<()> {
     let addr = listen_addr();
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    if STRESS_HASH_ROUNDS > 0 {
-        info!(
-            rounds = STRESS_HASH_ROUNDS,
-            "SHA-256 stress: chained rounds per message (blocking pool); set const to 0 to disable"
-        );
-    }
-
-    info!(%addr, "listening (WebSocket at /)");
+    // Intentionally no tracing INFO/WARN here — Railway counts stdout/stderr lines.
+    let _ = addr;
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -90,9 +86,9 @@ async fn main() -> anyhow::Result<()> {
 // WebSocketUpgrade: Extractor for establishing WebSocket connections.
 async fn websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     // Finalize upgrading the connection and call the provided callback with the stream.
-    ws.on_failed_upgrade(|error| warn!(%error, "websocket upgrade failed"))
-        .read_buffer_size(1024)
-        .write_buffer_size(1024)
+    ws.on_failed_upgrade(|_error| ())
+        .read_buffer_size(256 * 1024)
+        .write_buffer_size(256 * 1024)
         .on_upgrade(event_loop)
 }
 
@@ -102,8 +98,6 @@ async fn event_loop(mut socket: WebSocket) {
         if let Ok(msg) = msg {
             match msg {
                 Message::Text(utf8_bytes) => {
-                    // Never log full payloads at INFO (volume + Railway log limits + privacy).
-                    trace!(len = utf8_bytes.len(), "text frame");
                     stress_cpu_on_payload(utf8_bytes.as_bytes()).await;
                     let result = socket
                         .send(Message::Text(
@@ -111,14 +105,13 @@ async fn event_loop(mut socket: WebSocket) {
                         ))
                         .await;
                     if let Err(error) = result {
-                        warn!(%error, "send failed");
+                        let _ = error;
                         send_close_message(socket, 1011, &format!("Error occured: {}", error))
                             .await;
                         break;
                     }
                 }
                 Message::Binary(bytes) => {
-                    trace!(len = bytes.len(), "binary frame");
                     stress_cpu_on_payload(bytes.as_ref()).await;
                     let result = socket
                         .send(Message::Text(
@@ -126,7 +119,7 @@ async fn event_loop(mut socket: WebSocket) {
                         ))
                         .await;
                     if let Err(error) = result {
-                        warn!(%error, "send failed");
+                        let _ = error;
                         send_close_message(socket, 1011, &format!("Error occured: {}", error))
                             .await;
                         break;
@@ -141,7 +134,7 @@ async fn event_loop(mut socket: WebSocket) {
             }
         } else {
             let error = msg.err().unwrap();
-            warn!(?error, "recv failed");
+            let _ = error;
             send_close_message(socket, 1011, &format!("Error occured: {}", error)).await;
             break;
         }

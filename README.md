@@ -6,9 +6,9 @@
 
 ## What this repo is for
 
-- **Production-shaped deploy**: Docker, Railway, `PORT`, `RUST_LOG`, no per-frame log spam.
-- **Load generation**: [`stress/`](stress/) uses **uv** + asyncio + **websockets**; use **many connections**, **large payloads**, **multiple OS processes**, and **no `--interval`** to push throughput.
-- **CPU stress (server)**: **`STRESS_HASH_ROUNDS`** in [`src/main.rs`](src/main.rs) (hardcoded for this dummy repo). Each message is hashed that many times (chained SHA-256) on Tokio’s **blocking pool**. Set the **`const`** to **`0`** if you want echo-only.
+- **Production-shaped deploy**: Docker, Railway, `PORT`. **Tracing** defaults to **`error`** only and is **hard-capped at ERROR** (no `info!`/`warn!` on hot paths) so Railway log rate limits stay happy.
+- **Load generation**: [`stress/`](stress/) uses **uv** + asyncio + **websockets**; use **many connections**, **`--burst`** (pipeline sends per RTT), **`-P`** processes, **smaller payloads** for higher **msg/s**, and **no `--interval`**. **Huge payloads + CPU hashing** lowers msg/s on purpose.
+- **CPU stress (server)**: **`STRESS_HASH_ROUNDS`** in [`src/main.rs`](src/main.rs) defaults to **`0`** (max echo throughput). Set **`> 0`** only when you want chained SHA-256 work per message.
 
 ## Learning notes
 
@@ -27,11 +27,11 @@ This started from:
 cargo run
 ```
 
-You should see an **INFO** line with the bound address (default filter: `warn,ws_rust=info`). Override with **`RUST_LOG`** (e.g. `RUST_LOG=warn` on Railway).
+By default there is **no** startup log line. **`RUST_LOG`** defaults to **`error`**; the subscriber also uses **`with_max_level(ERROR)`**, so even a broad env filter cannot emit INFO/WARN/DEBUG/TRACE to stdout.
 
 ### CPU work (hardcoded)
 
-Edit **`const STRESS_HASH_ROUNDS: usize`** at the top of [`src/main.rs`](src/main.rs). **`0`** = no hashing (echo only). Non-zero = that many chained SHA-256 rounds per message before echoing (can dominate latency).
+Edit **`const STRESS_HASH_ROUNDS: usize`** at the top of [`src/main.rs`](src/main.rs). **`0`** = echo only (best msg/s). Non-zero = that many chained SHA-256 rounds per message (will slash throughput).
 
 ## Try it (WebSocket)
 
@@ -53,15 +53,17 @@ Connect to `ws://127.0.0.1:3000/` (or `ws://localhost:3000/`).
 ```bash
 cd stress
 uv sync
-# Throughput: no --interval, bigger payloads, more connections
-uv run ws-stress -c 200 -d 60 --payload-max 65536
-# Multiprocess client (splits -c across processes)
-uv run ws-stress -c 400 -d 60 -P 4
-# Binary frames + large payloads
-uv run ws-stress -c 100 -d 30 --binary --payload-min 4096 --payload-max 262144
+# High msg/s (deploy with STRESS_HASH_ROUNDS=0; small frames; pipeline many per RTT)
+uv run ws-stress \
+  --url 'wss://YOUR-SERVICE.up.railway.app/' \
+  -c 500 -d 120 -P 8 \
+  --payload-min 512 --payload-max 8192 \
+  --binary --burst 16 \
+  --progress-interval 10
+# CPU-heavy / low msg/s: raise STRESS_HASH_ROUNDS in main.rs and use large --payload-max
 ```
 
-Defaults target **`wss://ws-rust-production.up.railway.app/`**; override with **`--url`**. Omit **`--interval`** for full-speed loops. **`--progress-interval 0`** silences live lines. Be considerate of shared infrastructure and Railway limits.
+Defaults target **`wss://ws-rust-production.up.railway.app/`**; override with **`--url`**. Omit **`--interval`** for full-speed loops. With **`-P` > 1**, each OS process prints its own stats with a **`[wN]`** prefix (no shared counter). **`--progress-interval 0`** turns off those lines entirely—use a value like **`5`** if you want periodic output without spam. Be considerate of shared infrastructure and Railway limits.
 
 ## Stack
 
@@ -70,7 +72,7 @@ Defaults target **`wss://ws-rust-production.up.railway.app/`**; override with **
 | [axum](https://crates.io/crates/axum) (`ws`) | HTTP + WebSocket |
 | [tokio](https://crates.io/crates/tokio) | Async runtime |
 | [sha2](https://crates.io/crates/sha2) | Per-message SHA-256 (CPU stress; rounds = `const` in `main.rs`) |
-| [tracing](https://crates.io/crates/tracing) / [tracing-subscriber](https://crates.io/crates/tracing-subscriber) | Logging (`RUST_LOG`) |
+| [tracing](https://crates.io/crates/tracing) / [tracing-subscriber](https://crates.io/crates/tracing-subscriber) | Default `RUST_LOG=error`; `with_max_level(ERROR)` hard cap |
 | [anyhow](https://crates.io/crates/anyhow) | Errors in `main` |
 
 `serde` is in `Cargo.toml` for typical future use.
@@ -81,7 +83,7 @@ This repo includes a [`Dockerfile`](Dockerfile) and [`railway.toml`](railway.tom
 
 1. Push to GitHub and connect the repo in [Railway](https://railway.com).
 2. Railway sets **`PORT`**; the server listens on **`0.0.0.0`**.
-3. Optional: **`RUST_LOG=warn`** or **`error`** if you want minimal logs.
+3. You usually **do not** need **`RUST_LOG`** in Railway; the binary already caps output at **ERROR**.
 4. CPU stress level is whatever **`STRESS_HASH_ROUNDS`** is set to in source before you deploy (see [`src/main.rs`](src/main.rs)).
 5. Use the public URL with **`wss://`** for browsers. **`ws://`** is for localhost only.
 

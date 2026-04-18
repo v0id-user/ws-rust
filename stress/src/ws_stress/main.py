@@ -24,6 +24,15 @@ import websockets
 DEFAULT_URL = "wss://ws-rust-production.up.railway.app/"
 
 
+def configure_line_buffered_streams() -> None:
+    """Avoid block-buffered stdout in workers / pipes so lines show up immediately."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)  # py3.7+
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 class Progress:
     """Thread-safe (asyncio) counters for live progress lines."""
 
@@ -47,8 +56,13 @@ class Progress:
             return self.msgs, self.errors
 
 
-async def progress_reporter(stop: asyncio.Event, progress: Progress, interval_s: float) -> None:
-    """Print aggregate stats every interval_s until stop is set."""
+async def progress_reporter(
+    stop: asyncio.Event,
+    progress: Progress,
+    interval_s: float,
+    line_prefix: str,
+) -> None:
+    """Print aggregate stats every interval_s until stop is set (one asyncio loop / process)."""
     if interval_s <= 0:
         await stop.wait()
         return
@@ -62,7 +76,7 @@ async def progress_reporter(stop: asyncio.Event, progress: Progress, interval_s:
             elapsed = time.perf_counter() - t0
             rate = msgs / elapsed if elapsed > 0 else 0.0
             print(
-                f"  [{elapsed:6.1f}s] msgs={msgs}  ~{rate:.0f} msg/s  errors={errs}",
+                f"{line_prefix}[{elapsed:6.1f}s] msgs={msgs}  ~{rate:.0f} msg/s  errors={errs}",
                 flush=True,
             )
 
@@ -98,6 +112,7 @@ async def run_one_connection(
     open_timeout_s: float,
     progress: Progress | None,
     use_binary: bool,
+    burst: int,
 ) -> ConnStats:
     stats = ConnStats()
     if ramp_delay_s > 0:
@@ -110,24 +125,32 @@ async def run_one_connection(
             ping_interval=20,
             ping_timeout=20,
             close_timeout=10,
+            max_size=16 * 1024 * 1024,
         ) as ws:
             deadline = time.monotonic() + duration_s
+            b = max(1, burst)
             while time.monotonic() < deadline:
-                n = random.randint(payload_min, payload_max)
-                if use_binary:
-                    prefix = f"c{conn_id}:{stats.sent}:".encode()
-                    body = prefix + (b"x" * max(0, n))
-                else:
-                    body = f"c{conn_id}:{stats.sent}:" + ("x" * max(0, n))
                 t0 = time.perf_counter()
-                await ws.send(body)
-                _ = await ws.recv()
+                sent = 0
+                while sent < b and time.monotonic() < deadline:
+                    pad = random.randint(payload_min, payload_max)
+                    if use_binary:
+                        prefix = f"c{conn_id}:{stats.sent}:".encode()
+                        body = prefix + (b"x" * max(0, pad))
+                    else:
+                        body = f"c{conn_id}:{stats.sent}:" + ("x" * max(0, pad))
+                    await ws.send(body)
+                    stats.sent += 1
+                    sent += 1
+                if sent == 0:
+                    break
+                for _ in range(sent):
+                    _ = await ws.recv()
+                    stats.recv += 1
                 rtt_ms = (time.perf_counter() - t0) * 1000.0
                 stats.latencies_ms.append(rtt_ms)
-                stats.sent += 1
-                stats.recv += 1
                 if progress is not None:
-                    await progress.record_msg(1)
+                    await progress.record_msg(sent)
                 if interval_s is not None and interval_s > 0:
                     await asyncio.sleep(interval_s)
     except Exception as e:  # noqa: BLE001 — surface any failure per connection
@@ -212,6 +235,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Send binary frames instead of text (larger payloads are cheaper on the wire)",
     )
+    p.add_argument(
+        "--burst",
+        type=int,
+        default=1,
+        help="Pipeline: send N frames then recv N (order preserved). Higher = more in-flight per RTT. Default: 1",
+    )
     return p.parse_args(argv)
 
 
@@ -223,16 +252,25 @@ def _split_connections(total: int, parts: int) -> list[int]:
     return [base + (1 if i < rem else 0) for i in range(parts)]
 
 
-def _mp_worker(item: tuple[dict[str, Any], int, int]) -> dict[str, Any]:
-    """Picklable entry point for ProcessPoolExecutor."""
-    d, conn_id_base, conn_count = item
+def _mp_worker(item: tuple[dict[str, Any], int, int, int]) -> dict[str, Any]:
+    """Picklable entry point for ProcessPoolExecutor (each process: own asyncio + Progress lock)."""
+    configure_line_buffered_streams()
+    d, conn_id_base, conn_count, worker_id = item
     args = argparse.Namespace(**d)
+    if args.progress_interval <= 0:
+        print(
+            f"[w{worker_id}] started ({conn_count} conns × {args.duration}s) — "
+            "--progress-interval 0, so no periodic stats (stderr)",
+            file=sys.stderr,
+            flush=True,
+        )
     return asyncio.run(
         run_all(
             args,
             conn_id_base=conn_id_base,
             connections=conn_count,
-            progress_interval=0.0,
+            progress_interval=args.progress_interval,
+            worker_id=worker_id,
         )
     )
 
@@ -278,6 +316,7 @@ async def run_all(
     conn_id_base: int = 0,
     connections: int | None = None,
     progress_interval: float | None = None,
+    worker_id: int | None = None,
 ) -> dict[str, Any]:
     if args.duration <= 0:
         raise SystemExit("--duration must be > 0")
@@ -288,6 +327,7 @@ async def run_all(
     if conns < 1:
         raise SystemExit("--connections must be >= 1")
     prog_iv = progress_interval if progress_interval is not None else args.progress_interval
+    line_prefix = f"[w{worker_id}] " if worker_id is not None else ""
 
     ramp = args.ramp_up
     delays: list[float]
@@ -299,7 +339,9 @@ async def run_all(
 
     progress = Progress()
     stop_progress = asyncio.Event()
-    reporter = asyncio.create_task(progress_reporter(stop_progress, progress, prog_iv))
+    reporter = asyncio.create_task(
+        progress_reporter(stop_progress, progress, prog_iv, line_prefix)
+    )
 
     tasks = [
         asyncio.create_task(
@@ -314,13 +356,14 @@ async def run_all(
                 open_timeout_s=args.open_timeout,
                 progress=progress,
                 use_binary=args.binary,
+                burst=args.burst,
             )
         )
         for i in range(conns)
     ]
 
     if prog_iv > 0:
-        print("  [   0.0s] workers started", flush=True)
+        print(f"{line_prefix}[   0.0s] {conns} conns started", flush=True)
 
     wall0 = time.perf_counter()
     try:
@@ -362,17 +405,20 @@ async def run_all(
 
 
 def main() -> None:
+    configure_line_buffered_streams()
     args = parse_args()
     if args.connections < 1:
         raise SystemExit("--connections must be >= 1")
     if args.processes < 1:
         raise SystemExit("--processes must be >= 1")
+    if args.burst < 1:
+        raise SystemExit("--burst must be >= 1")
 
     print(f"Target: {args.url}")
     print(
         f"Plan: {args.connections} connections × {args.duration}s "
         f"(interval={args.interval!r}, ramp_up={args.ramp_up}s, "
-        f"processes={args.processes}, binary={args.binary})",
+        f"processes={args.processes}, binary={args.binary}, burst={args.burst})",
         flush=True,
     )
     if args.processes > 1 and args.ramp_up > 0:
@@ -380,15 +426,26 @@ def main() -> None:
             "note: --ramp-up is ignored when using multiple processes",
             file=sys.stderr,
         )
-    if args.progress_interval > 0 and args.processes == 1:
-        print(
-            f"Live progress every {args.progress_interval}s "
-            "(disable with --progress-interval 0)",
-            flush=True,
-        )
+    if args.progress_interval > 0:
+        if args.processes == 1:
+            print(
+                f"Live progress every {args.progress_interval}s "
+                "(disable with --progress-interval 0)",
+                flush=True,
+            )
+        else:
+            print(
+                f"Each of {args.processes} processes logs independently with prefix "
+                f"[w0]..[w{args.processes - 1}] every {args.progress_interval}s "
+                "(no shared counter; use --progress-interval 0 to silence)",
+                flush=True,
+            )
     elif args.processes > 1:
         print(
-            "note: live progress disabled in multiprocess mode (each worker is quiet)",
+            "note: --progress-interval 0 disables periodic [wN] lines. "
+            "You will only see one stderr line per worker at start, then silence until the end. "
+            "Use e.g. --progress-interval 5 for live stats.",
+            file=sys.stderr,
             flush=True,
         )
     print(flush=True)
@@ -398,15 +455,19 @@ def main() -> None:
         else:
             from concurrent.futures import ProcessPoolExecutor, as_completed
 
+            print(
+                f"Spawning workers (stdout may look idle until they connect)…",
+                flush=True,
+            )
             counts = _split_connections(args.connections, args.processes)
-            items: list[tuple[dict[str, Any], int, int]] = []
+            items: list[tuple[dict[str, Any], int, int, int]] = []
             base = 0
             d_base = dict(vars(args))
             d_base["ramp_up"] = 0.0
-            for n in counts:
+            for worker_id, n in enumerate(counts):
                 if n <= 0:
                     continue
-                items.append((d_base.copy(), base, n))
+                items.append((d_base.copy(), base, n, worker_id))
                 base += n
             summaries: list[dict[str, Any]] = []
             with ProcessPoolExecutor(max_workers=args.processes) as pool:
