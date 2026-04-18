@@ -67,6 +67,8 @@ async def progress_reporter(
         await stop.wait()
         return
     t0 = time.perf_counter()
+    last_msgs = 0
+    last_t = t0
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_s)
@@ -74,9 +76,21 @@ async def progress_reporter(
         except asyncio.TimeoutError:
             msgs, errs = await progress.snapshot()
             elapsed = time.perf_counter() - t0
-            rate = msgs / elapsed if elapsed > 0 else 0.0
+            rate_avg = msgs / elapsed if elapsed > 0 else 0.0
+            now = time.perf_counter()
+            chunk = msgs - last_msgs
+            dt = now - last_t
+            rate_inst = chunk / dt if dt > 0 else 0.0
+            last_msgs = msgs
+            last_t = now
+            # msgs = completed burst rounds (each may be burst>1 frames)
             print(
-                f"{line_prefix}[{elapsed:6.1f}s] msgs={msgs}  ~{rate:.0f} msg/s  errors={errs}",
+                f"{line_prefix}"
+                f"{elapsed:7.1f}s  "
+                f"msgs {msgs:>9}  "
+                f"avg {rate_avg:>7.0f}/s  "
+                f"inst {rate_inst:>7.0f}/s  "
+                f"err {errs:>4}",
                 flush=True,
             )
 
@@ -363,7 +377,13 @@ async def run_all(
     ]
 
     if prog_iv > 0:
-        print(f"{line_prefix}[   0.0s] {conns} conns started", flush=True)
+        print(
+            f"{line_prefix}"
+            f"{0.0:7.1f}s  "
+            f"start {conns:>3} conns  "
+            f"(burst={args.burst} payload {args.payload_min}..{args.payload_max} {'bin' if args.binary else 'txt'})",
+            flush=True,
+        )
 
     wall0 = time.perf_counter()
     try:
@@ -404,6 +424,81 @@ async def run_all(
     return out
 
 
+def _dedupe_errors(samples: list[str], *, limit: int = 8) -> list[tuple[str, int]]:
+    counts: dict[str, int] = {}
+    for s in samples:
+        key = s[:200] if len(s) > 200 else s
+        counts[key] = counts.get(key, 0) + 1
+    items = sorted(counts.items(), key=lambda x: -x[1])
+    return items[:limit]
+
+
+def print_final_summary(args: argparse.Namespace, summary: dict[str, Any]) -> None:
+    """Structured summary to stdout."""
+    sent = summary["total_sent"]
+    recv = summary["total_recv"]
+    gap = sent - recv
+    wall = summary["wall_s"]
+    mps = summary["msgs_per_s"]
+    cerr = summary["connection_errors"]
+    conns = summary["connections"]
+
+    sep = "─" * 76
+    print(sep, flush=True)
+    print("  ws-stress — run finished", flush=True)
+    print(sep, flush=True)
+    print(f"  URL           {args.url}", flush=True)
+    print(
+        f"  Plan          {conns} conns × {args.duration}s  "
+        f"P={args.processes}  burst={args.burst}  "
+        f"payload {args.payload_min}..{args.payload_max}  "
+        f"{'binary' if args.binary else 'text'}",
+        flush=True,
+    )
+    print(f"  Wall time     {wall:.2f}s  (wall clock for this process / slowest worker in -P mode)", flush=True)
+    print(flush=True)
+    print("  Throughput", flush=True)
+    print(f"    messages sent     {sent:>12,}", flush=True)
+    print(f"    messages received {recv:>12,}", flush=True)
+    if gap != 0:
+        print(
+            f"    gap (sent−recv)   {gap:>12,}  "
+            "(partial burst or disconnect before all replies arrived)",
+            flush=True,
+        )
+    else:
+        print("    gap (sent−recv)            0", flush=True)
+    print(f"    aggregate rate    {mps:>12,.1f} msg/s  (sent / wall time)", flush=True)
+    print(flush=True)
+    print("  Latency  (one sample per burst round-trip, ms)", flush=True)
+    print(
+        f"    mean {summary['latency_ms_mean']:8.2f}   "
+        f"p50 {summary['latency_ms_p50']:8.2f}   "
+        f"p95 {summary['latency_ms_p95']:8.2f}   "
+        f"p99 {summary['latency_ms_p99']:8.2f}",
+        flush=True,
+    )
+    print(flush=True)
+    print("  Connection errors  (tasks that raised; one connection can fail once)", flush=True)
+    print(f"    count           {cerr:>12}", flush=True)
+    if sent > 0:
+        print(f"    recv completion {100.0 * recv / sent:>11.2f}%  (recv/sent)", flush=True)
+    if cerr > 0:
+        print(
+            "    status          some connections dropped — see samples below",
+            flush=True,
+        )
+    else:
+        print("    status          no connection-level exceptions", flush=True)
+    samples = summary.get("sample_errors") or []
+    if samples:
+        print(flush=True)
+        print("  Error samples  (deduplicated, up to 8)", flush=True)
+        for text, cnt in _dedupe_errors(samples):
+            print(f"    ×{cnt}  {text}", flush=True)
+    print(sep, flush=True)
+
+
 def main() -> None:
     configure_line_buffered_streams()
     args = parse_args()
@@ -414,11 +509,17 @@ def main() -> None:
     if args.burst < 1:
         raise SystemExit("--burst must be >= 1")
 
-    print(f"Target: {args.url}")
+    hdr = "═" * 76
+    print(hdr, flush=True)
+    print("  ws-stress", flush=True)
+    print(hdr, flush=True)
+    print(f"  URL     {args.url}", flush=True)
     print(
-        f"Plan: {args.connections} connections × {args.duration}s "
-        f"(interval={args.interval!r}, ramp_up={args.ramp_up}s, "
-        f"processes={args.processes}, binary={args.binary}, burst={args.burst})",
+        f"  Plan    {args.connections} conns × {args.duration}s  "
+        f"processes={args.processes}  burst={args.burst}  "
+        f"payload {args.payload_min}..{args.payload_max}  "
+        f"{'binary' if args.binary else 'text'}  "
+        f"interval={args.interval!r}",
         flush=True,
     )
     if args.processes > 1 and args.ramp_up > 0:
@@ -456,7 +557,7 @@ def main() -> None:
             from concurrent.futures import ProcessPoolExecutor, as_completed
 
             print(
-                f"Spawning workers (stdout may look idle until they connect)…",
+                "  Spawning worker processes (live lines prefixed [wN])…",
                 flush=True,
             )
             counts = _split_connections(args.connections, args.processes)
@@ -479,20 +580,7 @@ def main() -> None:
         print("\nInterrupted.", file=sys.stderr)
         raise SystemExit(130) from None
 
-    print()
-    print(f"Wall time:     {summary['wall_s']:.2f}s")
-    print(f"Messages sent: {summary['total_sent']}  recv: {summary['total_recv']}")
-    print(f"Aggregate:     {summary['msgs_per_s']:.1f} msg/s")
-    print(
-        "Latency (ms):  "
-        f"mean={summary['latency_ms_mean']:.2f}  "
-        f"p50={summary['latency_ms_p50']:.2f}  "
-        f"p95={summary['latency_ms_p95']:.2f}  "
-        f"p99={summary['latency_ms_p99']:.2f}",
-    )
-    print(f"Conn errors:   {summary['connection_errors']}")
-    for err in summary["sample_errors"]:
-        print(f"  sample: {err}")
+    print_final_summary(args, summary)
 
 
 if __name__ == "__main__":
