@@ -1,7 +1,7 @@
 [project]
 name = "ws-stress"
 version = "0.1.0"
-description = "WebSocket load generator for ws-rust (asyncio + websockets)"
+description = "WebSocket load generator for ws-rust: many connections, large payloads, multiprocess"
 requires-python = ">=3.11"
 dependencies = [
     "websockets>=16.0",

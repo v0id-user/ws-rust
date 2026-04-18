@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import random
 import statistics
 import sys
@@ -96,6 +97,7 @@ async def run_one_connection(
     ramp_delay_s: float,
     open_timeout_s: float,
     progress: Progress | None,
+    use_binary: bool,
 ) -> ConnStats:
     stats = ConnStats()
     if ramp_delay_s > 0:
@@ -112,7 +114,11 @@ async def run_one_connection(
             deadline = time.monotonic() + duration_s
             while time.monotonic() < deadline:
                 n = random.randint(payload_min, payload_max)
-                body = f"c{conn_id}:{stats.sent}:" + ("x" * max(0, n))
+                if use_binary:
+                    prefix = f"c{conn_id}:{stats.sent}:".encode()
+                    body = prefix + (b"x" * max(0, n))
+                else:
+                    body = f"c{conn_id}:{stats.sent}:" + ("x" * max(0, n))
                 t0 = time.perf_counter()
                 await ws.send(body)
                 _ = await ws.recv()
@@ -194,36 +200,112 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="SEC",
         help="Print live stats every SEC seconds (0 = disable). Default: 1",
     )
+    p.add_argument(
+        "-P",
+        "--processes",
+        type=int,
+        default=1,
+        help="OS processes, each running asyncio (splits -c across them). Default: 1",
+    )
+    p.add_argument(
+        "--binary",
+        action="store_true",
+        help="Send binary frames instead of text (larger payloads are cheaper on the wire)",
+    )
     return p.parse_args(argv)
 
 
-async def run_all(args: argparse.Namespace) -> dict[str, Any]:
-    if args.connections < 1:
-        raise SystemExit("--connections must be >= 1")
+def _split_connections(total: int, parts: int) -> list[int]:
+    if parts <= 0:
+        return []
+    base = total // parts
+    rem = total % parts
+    return [base + (1 if i < rem else 0) for i in range(parts)]
+
+
+def _mp_worker(item: tuple[dict[str, Any], int, int]) -> dict[str, Any]:
+    """Picklable entry point for ProcessPoolExecutor."""
+    d, conn_id_base, conn_count = item
+    args = argparse.Namespace(**d)
+    return asyncio.run(
+        run_all(
+            args,
+            conn_id_base=conn_id_base,
+            connections=conn_count,
+            progress_interval=0.0,
+        )
+    )
+
+
+def merge_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    if not summaries:
+        return {}
+    wall_s = max(s["wall_s"] for s in summaries)
+    total_sent = sum(s["total_sent"] for s in summaries)
+    total_recv = sum(s["total_recv"] for s in summaries)
+    total_err = sum(s["connection_errors"] for s in summaries)
+    msgs_per_s = total_sent / wall_s if wall_s > 0 else 0.0
+    conns = sum(s["connections"] for s in summaries)
+
+    ok_msgs = sum(s["total_sent"] for s in summaries)
+    if ok_msgs > 0:
+        mean = sum(s["latency_ms_mean"] * s["total_sent"] for s in summaries) / ok_msgs
+    else:
+        mean = float("nan")
+
+    def _mx(key: str) -> float:
+        vals = [s[key] for s in summaries if not math.isnan(s[key])]
+        return max(vals) if vals else float("nan")
+
+    return {
+        "wall_s": wall_s,
+        "connections": conns,
+        "total_sent": total_sent,
+        "total_recv": total_recv,
+        "connection_errors": total_err,
+        "msgs_per_s": msgs_per_s,
+        "latency_ms_mean": mean,
+        "latency_ms_p50": _mx("latency_ms_p50"),
+        "latency_ms_p95": _mx("latency_ms_p95"),
+        "latency_ms_p99": _mx("latency_ms_p99"),
+        "sample_errors": [e for s in summaries for e in s.get("sample_errors", [])][:5],
+    }
+
+
+async def run_all(
+    args: argparse.Namespace,
+    *,
+    conn_id_base: int = 0,
+    connections: int | None = None,
+    progress_interval: float | None = None,
+) -> dict[str, Any]:
     if args.duration <= 0:
         raise SystemExit("--duration must be > 0")
     if args.payload_min < 0 or args.payload_max < args.payload_min:
         raise SystemExit("invalid --payload-min / --payload-max")
 
+    conns = connections if connections is not None else args.connections
+    if conns < 1:
+        raise SystemExit("--connections must be >= 1")
+    prog_iv = progress_interval if progress_interval is not None else args.progress_interval
+
     ramp = args.ramp_up
     delays: list[float]
-    if ramp > 0 and args.connections > 1:
-        step = ramp / (args.connections - 1)
-        delays = [i * step for i in range(args.connections)]
+    if ramp > 0 and conns > 1:
+        step = ramp / (conns - 1)
+        delays = [i * step for i in range(conns)]
     else:
-        delays = [0.0] * args.connections
+        delays = [0.0] * conns
 
     progress = Progress()
     stop_progress = asyncio.Event()
-    reporter = asyncio.create_task(
-        progress_reporter(stop_progress, progress, args.progress_interval)
-    )
+    reporter = asyncio.create_task(progress_reporter(stop_progress, progress, prog_iv))
 
     tasks = [
         asyncio.create_task(
             run_one_connection(
                 args.url,
-                conn_id=i,
+                conn_id=i + conn_id_base,
                 duration_s=args.duration,
                 interval_s=args.interval,
                 payload_min=args.payload_min,
@@ -231,12 +313,13 @@ async def run_all(args: argparse.Namespace) -> dict[str, Any]:
                 ramp_delay_s=delays[i],
                 open_timeout_s=args.open_timeout,
                 progress=progress,
+                use_binary=args.binary,
             )
         )
-        for i in range(args.connections)
+        for i in range(conns)
     ]
 
-    if args.progress_interval > 0:
+    if prog_iv > 0:
         print("  [   0.0s] workers started", flush=True)
 
     wall0 = time.perf_counter()
@@ -256,7 +339,7 @@ async def run_all(args: argparse.Namespace) -> dict[str, Any]:
 
     out: dict[str, Any] = {
         "wall_s": wall_s,
-        "connections": args.connections,
+        "connections": conns,
         "total_sent": total_sent,
         "total_recv": total_recv,
         "connection_errors": total_err,
@@ -280,21 +363,57 @@ async def run_all(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    if args.connections < 1:
+        raise SystemExit("--connections must be >= 1")
+    if args.processes < 1:
+        raise SystemExit("--processes must be >= 1")
+
     print(f"Target: {args.url}")
     print(
         f"Plan: {args.connections} connections × {args.duration}s "
-        f"(interval={args.interval!r}, ramp_up={args.ramp_up}s)",
+        f"(interval={args.interval!r}, ramp_up={args.ramp_up}s, "
+        f"processes={args.processes}, binary={args.binary})",
         flush=True,
     )
-    if args.progress_interval > 0:
+    if args.processes > 1 and args.ramp_up > 0:
+        print(
+            "note: --ramp-up is ignored when using multiple processes",
+            file=sys.stderr,
+        )
+    if args.progress_interval > 0 and args.processes == 1:
         print(
             f"Live progress every {args.progress_interval}s "
             "(disable with --progress-interval 0)",
             flush=True,
         )
+    elif args.processes > 1:
+        print(
+            "note: live progress disabled in multiprocess mode (each worker is quiet)",
+            flush=True,
+        )
     print(flush=True)
     try:
-        summary = asyncio.run(run_all(args))
+        if args.processes == 1:
+            summary = asyncio.run(run_all(args))
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+
+            counts = _split_connections(args.connections, args.processes)
+            items: list[tuple[dict[str, Any], int, int]] = []
+            base = 0
+            d_base = dict(vars(args))
+            d_base["ramp_up"] = 0.0
+            for n in counts:
+                if n <= 0:
+                    continue
+                items.append((d_base.copy(), base, n))
+                base += n
+            summaries: list[dict[str, Any]] = []
+            with ProcessPoolExecutor(max_workers=args.processes) as pool:
+                futs = [pool.submit(_mp_worker, it) for it in items]
+                for fut in as_completed(futs):
+                    summaries.append(fut.result())
+            summary = merge_summaries(summaries)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         raise SystemExit(130) from None

@@ -10,3 +10,4 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = { version = "1.0", default-features = false }
+sha2 = "0.11.0"

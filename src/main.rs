@@ -1,14 +1,18 @@
+use axum::Router;
 use axum::extract::ws::CloseFrame;
 use axum::http::StatusCode;
-use axum::Router;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
     routing::get,
 };
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use tracing::{info, trace, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Chained SHA-256 rounds per incoming message (0 = skip). Dummy project: edit here.
+const STRESS_HASH_ROUNDS: usize = 2000;
 
 fn listen_addr() -> SocketAddr {
     let port: u16 = std::env::var("PORT")
@@ -20,6 +24,34 @@ fn listen_addr() -> SocketAddr {
 
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+/// Chained SHA-256 (each round feeds the previous digest). Used only when `STRESS_HASH_ROUNDS` > 0.
+fn stress_hash_payload_bytes(data: &[u8], rounds: usize) -> [u8; 32] {
+    let mut buf = data.to_vec();
+    let mut out = [0u8; 32];
+    for _ in 0..rounds {
+        let mut h = Sha256::new();
+        h.update(&buf);
+        out = h.finalize().into();
+        buf.clear();
+        buf.extend_from_slice(&out);
+    }
+    out
+}
+
+async fn stress_cpu_on_payload(data: &[u8]) {
+    if STRESS_HASH_ROUNDS == 0 {
+        return;
+    }
+    let owned = data.to_vec();
+    let res = tokio::task::spawn_blocking(move || {
+        stress_hash_payload_bytes(&owned, STRESS_HASH_ROUNDS)
+    })
+    .await;
+    if let Err(err) = res {
+        warn!(?err, "stress hash task join failed");
+    }
 }
 
 fn init_tracing() {
@@ -42,6 +74,13 @@ async fn main() -> anyhow::Result<()> {
     let addr = listen_addr();
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
+    if STRESS_HASH_ROUNDS > 0 {
+        info!(
+            rounds = STRESS_HASH_ROUNDS,
+            "SHA-256 stress: chained rounds per message (blocking pool); set const to 0 to disable"
+        );
+    }
+
     info!(%addr, "listening (WebSocket at /)");
     axum::serve(listener, app).await?;
 
@@ -52,9 +91,9 @@ async fn main() -> anyhow::Result<()> {
 async fn websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     // Finalize upgrading the connection and call the provided callback with the stream.
     ws.on_failed_upgrade(|error| warn!(%error, "websocket upgrade failed"))
-    .read_buffer_size(1024)
-    .write_buffer_size(1024)
-    .on_upgrade(event_loop)
+        .read_buffer_size(1024)
+        .write_buffer_size(1024)
+        .on_upgrade(event_loop)
 }
 
 async fn event_loop(mut socket: WebSocket) {
@@ -65,6 +104,7 @@ async fn event_loop(mut socket: WebSocket) {
                 Message::Text(utf8_bytes) => {
                     // Never log full payloads at INFO (volume + Railway log limits + privacy).
                     trace!(len = utf8_bytes.len(), "text frame");
+                    stress_cpu_on_payload(utf8_bytes.as_bytes()).await;
                     let result = socket
                         .send(Message::Text(
                             format!("Echo back text: {}", utf8_bytes).into(),
@@ -79,6 +119,7 @@ async fn event_loop(mut socket: WebSocket) {
                 }
                 Message::Binary(bytes) => {
                     trace!(len = bytes.len(), "binary frame");
+                    stress_cpu_on_payload(bytes.as_ref()).await;
                     let result = socket
                         .send(Message::Text(
                             format!("Received bytes of length: {}", bytes.len()).into(),
@@ -118,7 +159,7 @@ async fn event_loop(mut socket: WebSocket) {
 async fn send_close_message(mut socket: WebSocket, code: u16, reason: &str) {
     _ = socket
         .send(Message::Close(Some(CloseFrame {
-            code: code,
+            code,
             reason: reason.into(),
         })))
         .await;
