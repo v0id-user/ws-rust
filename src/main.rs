@@ -7,6 +7,8 @@ use axum::{
     routing::get,
 };
 use std::net::SocketAddr;
+use tracing::{info, trace, warn};
+use tracing_subscriber::EnvFilter;
 
 fn listen_addr() -> SocketAddr {
     let port: u16 = std::env::var("PORT")
@@ -20,8 +22,19 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // Default: quiet libraries; this crate logs INFO only for startup/diagnostics.
+        // Per-message noise is TRACE (off unless RUST_LOG=trace or RUST_LOG=ws_rust=trace).
+        EnvFilter::new("warn,ws_rust=info")
+    });
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/", get(websocket_handler));
@@ -29,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = listen_addr();
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    println!("Listening on http://{addr} (WebSocket at /)");
+    info!(%addr, "listening (WebSocket at /)");
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -38,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 // WebSocketUpgrade: Extractor for establishing WebSocket connections.
 async fn websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     // Finalize upgrading the connection and call the provided callback with the stream.
-    ws.on_failed_upgrade(|error| println!("Error upgrading websocket: {}", error))
+    ws.on_failed_upgrade(|error| warn!(%error, "websocket upgrade failed"))
     .read_buffer_size(1024)
     .write_buffer_size(1024)
     .on_upgrade(event_loop)
@@ -50,28 +63,29 @@ async fn event_loop(mut socket: WebSocket) {
         if let Ok(msg) = msg {
             match msg {
                 Message::Text(utf8_bytes) => {
-                    println!("Text received: {}", utf8_bytes);
+                    // Never log full payloads at INFO (volume + Railway log limits + privacy).
+                    trace!(len = utf8_bytes.len(), "text frame");
                     let result = socket
                         .send(Message::Text(
                             format!("Echo back text: {}", utf8_bytes).into(),
                         ))
                         .await;
                     if let Err(error) = result {
-                        println!("Error sending: {}", error);
+                        warn!(%error, "send failed");
                         send_close_message(socket, 1011, &format!("Error occured: {}", error))
                             .await;
                         break;
                     }
                 }
                 Message::Binary(bytes) => {
-                    println!("Received bytes of length: {}", bytes.len());
+                    trace!(len = bytes.len(), "binary frame");
                     let result = socket
                         .send(Message::Text(
                             format!("Received bytes of length: {}", bytes.len()).into(),
                         ))
                         .await;
                     if let Err(error) = result {
-                        println!("Error sending: {}", error);
+                        warn!(%error, "send failed");
                         send_close_message(socket, 1011, &format!("Error occured: {}", error))
                             .await;
                         break;
@@ -86,7 +100,7 @@ async fn event_loop(mut socket: WebSocket) {
             }
         } else {
             let error = msg.err().unwrap();
-            println!("Error receiving message: {:?}", error);
+            warn!(?error, "recv failed");
             send_close_message(socket, 1011, &format!("Error occured: {}", error)).await;
             break;
         }

@@ -2,3 +2,6 @@
 .env
 .env.*
 !.env.example
+stress/.venv/
+__pycache__/
+*.py[cod]
