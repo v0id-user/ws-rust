@@ -1,0 +1,7 @@
+# https://docs.railway.com/reference/config-as-code
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 100
